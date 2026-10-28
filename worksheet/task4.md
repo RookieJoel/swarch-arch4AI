@@ -1,14 +1,14 @@
 # Task 4: Deployment topologies and trade-offs
 
-**Name / ชื่อ:**
+**Name / ชื่อ:** สุทธนพ ชะนะ
 
-**Student ID / รหัสนิสิต:**
+**Student ID / รหัสนิสิต:** 6632239821
 
 This is **individual work**: each student completes and submits their own copy, in their own fork.
 
 *งานนี้เป็น**งานเดี่ยว** นิสิตแต่ละคนทำและส่งงานของตัวเอง ใน fork ของตัวเอง*
 
-**Scenario (A, B or C) / Scenario ที่เลือก:**
+**Scenario (A, B or C) / Scenario ที่เลือก:** A
 
 Choose **one** scenario below. If the last digit of your student ID is odd, take A or B; if it is even, take B or C. Use your measurements from Tutorial 6 as evidence: cite run names from `results/runs.csv`. Answer in Thai or English.
 
@@ -58,9 +58,9 @@ The three most important quality requirements for your scenario, each with a num
 
 | # | Quality | Requirement |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | Latency| เจ้าของร้านได้รับ push notification ภายใน 2 วินาที หลังส่งรีวิว โดยกำหนด timeout ของการเรียก large ที่ 1 วินาที และจัดงบเวลาสำหรับขั้นตอนอื่นรวมการส่ง push|
+| 2 | Throughput| รองรับ 40 reviews/s และเรียก large ไม่เกิน 20 calls/s โดยตั้งเป้าใช้งานไม่เกิน 16 calls/s เพื่อสำรอง capacity อย่างน้อย 20% |
+| 3 | Precision | ตั้งเป้า precision ของ alert เชิงลบ ≥95% กล่าวคือ alert ที่ส่งผิดไม่เกิน 5% ของ alert ทั้งหมด หากไม่มั่นใจหรือ large timeout ให้สถานะ pending และไม่ส่ง alert|
 
 ## 2. Design / การออกแบบ
 
@@ -68,16 +68,34 @@ Your topology, the patterns you add, and a container-level diagram (C4 level 2).
 
 *topology ที่เลือก pattern ที่เพิ่ม และ diagram ระดับ container (C4 level 2) เขียนด้วย Mermaid*
 
+**Topology:** T3 Hybrid. **Patterns:** cascade, cache, fallback.
+
 ```mermaid
 C4Container
-    title Your design: container diagram
-    %% Replace the example below with your own people, containers and relationships.
-    %% See the CampusEats C4 diagram in README.md for the full syntax.
+    title Scenario A: owner alerts (T3 Hybrid + cascade + cache + fallback)
     Person(customer, "Customer", "Writes restaurant reviews")
+    Person(owner, "Restaurant owner", "Receives negative-review alerts")
+    System_Ext(push, "Push provider", "Delivers push notifications to the owner's phone")
+
     System_Boundary(campuseats, "CampusEats") {
-        Container(review, "Review service", "Python, FastAPI", "What it does")
+        Container(gateway, "Gateway", "Python, FastAPI", "Entry point for customers")
+        Container(review, "Review service", "Python, FastAPI", "Runs the cascade: small model first, escalates uncertain reviews to large. Applies the 1 s timeout and the fallback to pending")
+        Container(small, "Small model", "Library inside Review service", "Fast local prediction with a confidence score")
+        ContainerDb(cache, "Prediction cache", "In-memory, max_size", "Normalised review text to cached label")
+        Container(inference, "Inference service", "Python, FastAPI", "Hosts the large model: max 20 calls/s, 4 concurrent")
+        ContainerDb(reviewdb, "Review store", "Database", "Reviews with label or status pending")
+        Container(alert, "Alert service", "Python", "Alert policy: sends only negative labels given by the large model, skips if the 2 s deadline is missed")
     }
-    Rel(customer, review, "Posts reviews", "HTTP/JSON")
+
+    Rel(customer, gateway, "Posts review", "HTTP/JSON")
+    Rel(gateway, review, "Forwards review", "HTTP/JSON")
+    Rel(review, cache, "1. Looks up / stores label")
+    Rel(review, small, "2. Predicts", "in-process call")
+    Rel(review, inference, "3. Escalates uncertain reviews, timeout 1 s", "HTTP/JSON")
+    Rel(review, reviewdb, "Saves label or pending")
+    Rel(review, alert, "Sends negative label", "HTTP/JSON")
+    Rel(alert, push, "Sends notification", "HTTPS")
+    Rel(push, owner, "Alerts", "Push notification")
 ```
 
 ## 3. Evidence / หลักฐาน
@@ -88,8 +106,9 @@ Which runs support your choice? Show the numbers and, for scenario A, the capaci
 
 | Run | What it shows / แสดงอะไร |
 |---|---|
-| | |
-| | |
+|t0-large | เป็น baseline แบบเรียก large ทุกรีวิว เมื่อรับ 40 reviews/s จึงต้องเรียก large 40 calls/s เกิน capacity 20 calls/s เป็น 2 เท่า|
+| t2-0.7 | cascade threshold 0.7 อย่างเดียว เรียก large 53% -> 40 × 0.53 = 21.2 calls/s เกิน capacity 20 calls/s จึงต้องเพิ่ม cache |
+| t3-cache | threshold 0.7 + cache: เรียก large 38%, cache hits 35%, p95 = 543 ms, accuracy 93.0% -> 40 × 0.38 = 15.2 calls/s อยู่ภายใน capacity และเหลือ headroom 24% |
 
 ## 4. ADR
 
@@ -97,20 +116,37 @@ Use the ADR format from W5.
 
 *ใช้รูปแบบ ADR จาก W5*
 
-**Title:**
+**Title:** T3 Hybrid ร่วมกับ cascade, cache และ fallback
 
 **Status:** Proposed
 
-**Context:**
+**Context:** 
+CampusEats ต้องส่ง push notification ให้เจ้าของร้านภายใน 2 วินาที เมื่อพบรีวิวเชิงลบ ช่วงพีคมีรีวิว 40 รายการ/วินาที แต่ large model รองรับได้สูงสุด 20 calls/วินาที การเรียก large ทุกรีวิวจึงต้องการ capacity เป็นสองเท่าของที่มี
+
+การแจ้งเตือนผิดทำให้เจ้าของร้านสูญเสียความเชื่อมั่น ขณะที่การพลาดแจ้งเตือนบางครั้งยอมรับได้ จึงให้ความสำคัญกับ precision ของ alert เชิงลบ และอนุญาตให้ระบบงดแจ้งเตือนเมื่อไม่มั่นใจ
+
+จากตัวเลขของ t3-cache ที่ให้มา ระบบเรียก large 38% มี cache hits 35% และ latency p95 = 543 ms อย่างไรก็ตาม ยังไม่มีผลวัด precision ของ alert และยังต้องตรวจสอบ latency ตั้งแต่รับรีวิวจนเจ้าของร้านได้รับ push
 
 **Decision:**
+เลือก T3 Hybrid โดยรัน small model ภายใน Review service และเรียก large model ผ่าน remote inference service ร่วมกับรูปแบบดังนี้:
+
+- Cascade: ใช้ threshold 0.7 ให้ small ประมวลผลก่อน และส่งกรณีที่ไม่มั่นใจไปยัง large (threshold 0.7 อย่างเดียวเรียก large 53% = 21.2 calls/s เกิน capacity จึงต้องใช้ร่วมกับ cache) โดยทดสอบเกณฑ์ส่ง alert แยกจาก threshold ที่ใช้ตัดสินใจเรียก large
+
+- Cache: ใช้ผลเดิมที่ยังใช้ได้สำหรับรีวิวซ้ำ เพื่อลดจำนวน remote calls โดยใช้ t3-cache เป็นหลักฐานเริ่มต้นของการออกแบบ
+
+- Fallback: กำหนด timeout ของ large ที่ 1 วินาที หาก timeout ไม่มี capacity หรือผลยังไม่มั่นใจ ให้บันทึกสถานะ pending และไม่ส่ง alert
+
+- Alert policy: ส่ง alert เฉพาะผล negative ที่ **large model เป็นผู้ให้ label** (รวมผลที่ cache ไว้จาก large) ไม่ส่ง alert จากผล small อย่างเดียว เพราะ small อาจมั่นใจผิด เช่น รีวิวประชด ซึ่งจะเป็น alert ผิดที่ทำให้เจ้าของร้านเลิกเชื่อถือ การกำหนดนี้ไม่เพิ่มจำนวน call ไป large (ยังอยู่ที่ 15.2 calls/s) ตั้งเป้า precision ≥95% และส่งให้ถึงเจ้าของร้านภายใน 2 วินาที หากส่งไม่ทันให้ข้าม alert นั้น
+
+ระบบต้องจำกัดการเรียก large ไม่เกิน 20 calls/วินาที และ 4 calls พร้อมกัน เพื่อรับมือกับการกระจุกตัวของคำขอ แม้ค่าเฉลี่ยที่คำนวณได้จะอยู่ภายใน capacity ส่วนคำขอที่เกิน limit จะไม่เข้าคิวรอ แต่ถูกบันทึกเป็น pending และไม่ส่ง alert (load shedding)
 
 **Consequences:**
-- Positive:
-- Negative:
+- Positive: รองรับ peak ตามสัดส่วนการเรียก large ที่วัดได้ และลดค่าใช้จ่ายของ large เมื่อเทียบกับการเรียกทุกรีวิว การงดแจ้งเตือนเมื่อไม่มั่นใจช่วยให้ระบบไม่ต้องเดาผลในกรณีบริการขัดข้อง
+
+- Negative: ระบบซับซ้อนขึ้นจาก cascade, cache และการจัดการ timeout และอาจพลาด alert บางรายการ โดยเฉพาะรีวิวเชิงลบที่ small มั่นใจและจบที่ small จะไม่มี alert เพราะเรายอมแลกความครบถ้วนกับ precision ผลด้าน capacity ขึ้นอยู่กับลักษณะรีวิวและ cache hit rate จึงต้องติดตามเมื่อใช้งานจริง นอกจากนี้ accuracy รวมยังยืนยันเป้าหมาย precision ≥95% ไม่ได้ และ p95 543 ms ยังไม่รับประกัน deadline ของทุก alert
 
 **Alternatives considered:** at least one topology you rejected, and why.
 
 *อย่างน้อยหนึ่ง topology ที่ไม่เลือก และเหตุผล*
 
->
+> T1 เรียก large แบบ synchronous ทุกรีวิว: ไม่เลือก เพราะต้องใช้ 40 calls/วินาที (t0-large) แต่รองรับได้เพียง 20 calls/วินาที ทำให้เกิดคำขอรอสะสมและเสี่ยงเกิน deadline 2 วินาที
